@@ -1,0 +1,11 @@
+[package]
+name = "factorial"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "factorial"
+path = "src/factorial.rs"
+
+[dependencies]
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", tag = "v2023_02_02"}
