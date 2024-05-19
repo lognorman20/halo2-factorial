@@ -1,11 +1,8 @@
 use std::marker::PhantomData;
 
 use halo2_proofs::{
-    arithmetic::FieldExt, circuit::*, halo2curves::pasta::Fp, plonk::*, poly::Rotation,
+    arithmetic::FieldExt, circuit::*, dev::MockProver, halo2curves::pasta::Fp, plonk::*, poly::Rotation
 };
-
-#[derive(Clone)]
-struct Number<F: FieldExt>(AssignedCell<F, F>);
 
 #[derive(Debug, Clone)]
 struct FactorialConfig {
@@ -71,8 +68,8 @@ impl<F: FieldExt> FactorialChip<F> {
         layouter.assign_region(
             || "factorial table",
             |mut region| {
-                self.config.selector.enable(&mut region, 0);
-                self.config.selector.enable(&mut region, 1);
+                let _ = self.config.selector.enable(&mut region, 0);
+                let _ = self.config.selector.enable(&mut region, 1);
 
                 let mut a_cell = region.assign_advice_from_instance(
                     || "a",
@@ -80,40 +77,87 @@ impl<F: FieldExt> FactorialChip<F> {
                     0,
                     self.config.advice[0],
                     0,
-                ).map(Number)?;
+                )?;
 
                 let mut b_cell = region.assign_advice(
                     || "b",
                     self.config.advice[1],
                     0,
-                    || a_cell.0.value().map(|a| *a + F::one())
-                ).map(Number)?;
+                    || a_cell.value().map(|a| *a + F::one()),
+                )?;
 
                 for row in 2..nrows {
                     let c_cell = region.assign_advice(
                         || "c",
                         self.config.advice[0],
                         row,
-                        || a_cell.0.value().and_then(|a| b_cell.0.value().map(|b| *a * *b))
-                    ).map(Number)?;
+                        || a_cell.value().and_then(|a| b_cell.value().map(|b| *a * *b)),
+                    )?;
 
-                    let d_cell: AssignedCell<F, F> = region.assign_advice(
+                    let d_cell = region.assign_advice(
                         || "d",
                         self.config.advice[1],
                         row,
-                        || b_cell.value().into() - Fp::one(), // problem line prolly
+                        || b_cell.value().map(|b| *b - F::one()),
                     )?;
 
                     a_cell = c_cell;
                     b_cell = d_cell;
                 }
 
-                Ok()
+                Ok(a_cell)
             },
         )
+    }
+
+    pub fn expose_public(
+        &self,
+        mut layouter: impl Layouter<F>,
+        cell: AssignedCell<F, F>,
+        row: usize,
+    ) -> Result<(), Error> {
+        layouter.constrain_instance(cell.cell(), self.config.instance, row)
+    }
+}
+
+#[derive(Default, Debug)]
+struct FactorialCircuit<F> {
+    n: usize,
+    _marker: PhantomData<F>,
+}
+
+impl<F: FieldExt> Circuit<F> for FactorialCircuit<F> {
+    type Config = FactorialConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::default()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        FactorialChip::configure(meta)
+    }
+
+    fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
+        let chip = FactorialChip::construct(config);
+        let output = chip.calculate(layouter.namespace(|| "chunk"), self.n)?;
+
+        let _ = chip.expose_public(layouter.namespace(|| "expose output"), output, 1);
+        Ok(())
     }
 }
 
 fn main() {
-    println!("SPOTEMGOTEM");
+    let arg = 5;
+    let circuit: FactorialCircuit<Fp> = FactorialCircuit {
+        n: arg,
+        _marker: PhantomData,
+    };
+
+    let public_inputs = vec![Fp::from(arg as u64)];
+    let k = 4;
+
+    // Given the correct public input, our circuit will verify.
+    let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
+    assert_eq!(prover.verify(), Ok(()));
 }
