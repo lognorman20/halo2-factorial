@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
 
 use halo2_proofs::{
-    arithmetic::FieldExt, circuit::*, dev::MockProver, halo2curves::pasta::Fp, plonk::*, poly::Rotation
+    arithmetic::FieldExt, circuit::*, dev::MockProver, halo2curves::pasta::Fp, plonk::*,
+    poly::Rotation,
 };
 
 #[derive(Debug, Clone)]
@@ -28,7 +29,8 @@ impl<F: FieldExt> FactorialChip<F> {
     pub fn configure(meta: &mut ConstraintSystem<F>) -> FactorialConfig {
         let col_a = meta.advice_column();
         let col_b = meta.advice_column();
-        let selector = meta.selector();
+        let q0 = meta.selector();
+        let q1 = meta.selector();
         let instance = meta.instance_column();
 
         meta.enable_equality(col_a);
@@ -36,26 +38,41 @@ impl<F: FieldExt> FactorialChip<F> {
         meta.enable_equality(instance);
 
         meta.create_gate("factorial", |meta| {
-            //
-            // col_a   |   col_b   |   selector
-            //   a     |     b     |      s
-            //   c     |     d     |      ?
-            //
-            let s = meta.query_selector(selector);
+            /* layout
+
+            col_a   |   col_b   |   instance
+              a     |     b     |    init
+              c     |     d     |   expected
+             ....   |   ....    |    ....
+
+            */
+            let s0 = meta.query_selector(q0);
+            let s1 = meta.query_selector(q1);
             let a = meta.query_advice(col_a, Rotation::cur());
             let b = meta.query_advice(col_b, Rotation::cur());
             let c = meta.query_advice(col_a, Rotation::next());
             let d = meta.query_advice(col_b, Rotation::next());
 
-            // constraints:
-            // b - (d + 1) == 0
-            // c - (a * b) == 0
-            vec![s * ((b.clone() - (d + Expression::Constant(F::one()))) + (c - (a * b)))]
+            /* constraint setup
+
+            general checks
+            c = a * b
+            d = b - 1
+            resulting constraints:
+            b - (d + 1) == 0
+            c - (a * b) == 0
+
+            */
+            let one = Expression::Constant(F::one());
+            vec![
+                s0 * (b.clone() - (d + one)),
+                s1 * (c - (a * b))
+            ]
         });
 
         FactorialConfig {
             advice: [col_a, col_b],
-            selector,
+            selector: q0,
             instance,
         }
     }
@@ -69,7 +86,6 @@ impl<F: FieldExt> FactorialChip<F> {
             || "factorial table",
             |mut region| {
                 let _ = self.config.selector.enable(&mut region, 0);
-                let _ = self.config.selector.enable(&mut region, 1);
 
                 let mut a_cell = region.assign_advice_from_instance(
                     || "a",
@@ -83,10 +99,14 @@ impl<F: FieldExt> FactorialChip<F> {
                     || "b",
                     self.config.advice[1],
                     0,
-                    || a_cell.value().map(|a| *a + F::one()),
+                    || a_cell.value().map(|a| *a - F::one()),
                 )?;
 
-                for row in 2..nrows {
+                for row in 1..nrows {
+                    if row < nrows - 1 {
+                        let _ = self.config.selector.enable(&mut region, row);
+                    }
+
                     let c_cell = region.assign_advice(
                         || "c",
                         self.config.advice[0],
@@ -138,24 +158,53 @@ impl<F: FieldExt> Circuit<F> for FactorialCircuit<F> {
         FactorialChip::configure(meta)
     }
 
-    fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
         let chip = FactorialChip::construct(config);
-        let output = chip.calculate(layouter.namespace(|| "chunk"), self.n)?;
+        let output = chip.calculate(layouter.namespace(|| "output"), self.n)?;
 
-        let _ = chip.expose_public(layouter.namespace(|| "expose output"), output, 1);
+        let _ = chip.expose_public(layouter.namespace(|| "expose output"), output, 1)?;
         Ok(())
     }
 }
 
+/// Calculates `n` factorial to be passed as public input
+pub fn factorial(n: u64) -> Fp {
+    Fp::from((1..n - 1).into_iter().fold(n, |acc, i| acc * (n - i)))
+}
+
 fn main() {
-    let arg = 5;
+    let arg = 6;
     let circuit: FactorialCircuit<Fp> = FactorialCircuit {
         n: arg,
         _marker: PhantomData,
     };
 
-    let public_inputs = vec![Fp::from(arg as u64)];
+    let expected_output = factorial(arg as u64);
+
+    let public_inputs = vec![Fp::from(arg as u64), expected_output];
     let k = 4;
+
+    use plotters::prelude::*;
+    let root = BitMapBackend::new("layout.png", (1024, 768)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    let root = root
+        .titled("Factorial Circuit Layout", ("sans-serif", 30))
+        .unwrap();
+
+    // Red background for advice columns, white for instance columns, and blue
+    // for fixed columns (with a darker blue for selectors).
+    halo2_proofs::dev::CircuitLayout::default()
+        // .view_width(0..4)
+        // .view_height(0..8)
+        .show_labels(true)
+        .show_equality_constraints(true)
+        .mark_equality_cells(true)
+        .render(k, &circuit, &root)
+        .unwrap();
 
     // Given the correct public input, our circuit will verify.
     let prover = MockProver::run(k, &circuit, vec![public_inputs.clone()]).unwrap();
